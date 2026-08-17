@@ -1,0 +1,202 @@
+name: paper
+
+# Build the paper PDF and publish it as a downloadable artefact.
+#
+# This lane exists because the paper cannot be fully built where it is written: the
+# development machine has pdflatex but no latexmk, and no guarantee of the same TeX
+# distribution a reviewer would use. CI is therefore the build of record, and a red run
+# here means the paper does not build -- not that a formatting nicety slipped.
+#
+# It also draws the figures, so what a reader sees is regenerated on every push rather
+# than exported by hand once and then quietly going stale. No PNG is committed: a figure
+# checked in as an image is a number nobody can reproduce. One 200 kB model checkpoint IS
+# committed, under `paper/model/`, because one figure needs a trained network and training
+# it takes hours -- see the step that draws it.
+on:
+  push:
+    branches: [master, main, "feat/**", "fix/**"]
+    paths:
+      - "paper/**"
+      - "src/pinn_ulof/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/paper.yml"
+  pull_request:
+    branches: [master, main]
+    paths:
+      - "paper/**"
+      - "src/pinn_ulof/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/paper.yml"
+  # Buildable on demand, because a paper is something you want a PDF of when you want it
+  # and not only when a file under `paper/` happens to change.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paper:
+    # ONE job, and the order inside it is the point: the paper embeds the figures, so
+    # they must be drawn before pdflatex runs or the build fails on a missing file. Two
+    # jobs would express that same ordering through `needs:` plus an artefact round-trip,
+    # which is more moving parts for a dependency that is already sequential.
+    name: draw figures, then build the paper PDF
+    runs-on: ubuntu-latest
+    # The figure step dominates: the open-loop reference is solved on the 2560-node
+    # scoring mesh and the closed-loop one on 160, which together took 858 s on a
+    # contended eight-core box, plus 356 s for the model figure. The TeX build is
+    # under a minute.
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      # `--locked` so CI builds the resolution in uv.lock rather than re-resolving. A
+      # figure drawn against a different scipy than the one recorded is a figure nobody
+      # can reproduce, which is the thing this lane exists to prevent.
+      - name: Sync dependencies
+        run: uv sync --locked --python 3.14
+
+      # Into `figures/` at the repository root, which is gitignored and is the first
+      # entry of the paper's \graphicspath. Drawing them requires solving the reference
+      # transient, so this step also proves the physics still runs -- there is no test
+      # suite here, and this is the closest thing to one that CI gets for free.
+      - name: Draw the figures the paper embeds
+        run: uv run pinn-ulof figures --outdir figures
+
+      # The one figure that cannot be drawn from the physics alone. It needs a trained
+      # model, and training takes hours, so a single 200 kB checkpoint is committed under
+      # `paper/model/` -- the exception to "checkpoints are build products", made because a
+      # figure nobody can regenerate is worse than a file in the repository.
+      - name: Draw the figure that needs a trained model
+        run: |
+          uv run pinn-ulof model-figures paper/model/shipped_f64_seed2.eqx --outdir figures
+
+      # The appendix ladder tables are `paper/data/ladder.json` rendered to LaTeX. This
+      # verifies every row of the data file appears in the paper, so the two cannot drift:
+      # hand-transcribing ninety numbers put two of them one unit out in the last digit.
+      - name: Check the ladder tables match their data
+        run: uv run pinn-ulof ladder-rows --check paper/paper.tex
+
+      # Every \includegraphics target must exist and be non-empty before the build. The
+      # artefact is the deliverable here, and `if-no-files-found: error` only catches an
+      # empty directory: a run where `model-figures` produced nothing would still publish
+      # eleven of fourteen. This names the missing file instead of leaving it to surface
+      # as a TeX error inside a container log.
+      - name: Check the figure set is complete
+        run: |
+          grep -o '\\includegraphics\[[^]]*\]{[^}]*}' paper/paper.tex \
+            | sed 's/.*{\(.*\)}/\1/' | sort -u > /tmp/want.txt
+          find figures -name '*.png' -size +0c -printf '%f\n' | sort -u > /tmp/got.txt
+          echo "paper references $(wc -l < /tmp/want.txt) figures;" \
+               "$(wc -l < /tmp/got.txt) non-empty files drawn"
+          rc=0
+          while read -r f; do
+            grep -qxF "$f" /tmp/got.txt || { echo "::error::paper references $f but it was not drawn"; rc=1; }
+          done < /tmp/want.txt
+          while read -r f; do
+            grep -qxF "$f" /tmp/want.txt || echo "::warning::$f is drawn but the paper does not reference it"
+          done < /tmp/got.txt
+          exit $rc
+
+      # Uploaded on failure as well as success: a run that drew the wrong figure is
+      # diagnosed by looking at it, and the step above will already have said which.
+      - name: Upload figures
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paper-figures
+          path: figures
+          if-no-files-found: error
+          retention-days: 90
+
+      # TeX Live as a container, not as an apt-get shopping list.
+      #
+      # Hand-assembling packages cost the sibling repository three red runs -- a missing
+      # `binhex.tex`, then `\Bbbk` clashing with amssymb, then a missing TS1 font metric
+      # -- and two of those were `--no-install-recommends` quietly dropping something a
+      # font needed. The official image carries a full TeX Live, so there is no package
+      # list to get wrong, and it pulls faster than apt was installing.
+      #
+      # `docker run` rather than a marketplace LaTeX action: those wrap this same image,
+      # and every action here is pinned to a full commit SHA.
+      #
+      # `--user` keeps the build output owned by the runner rather than by root, so the
+      # upload steps below can read it.
+      - name: Build paper.pdf
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$PWD":/work -w /work \
+            texlive/texlive:latest \
+            latexmk -pdf -file-line-error -interaction=nonstopmode -halt-on-error \
+              -outdir=build paper/paper.tex
+
+      # Surface the actual TeX error as a job annotation. When this fails it fails inside
+      # a container log, and the one line that matters is a single `!` buried in two
+      # hundred lines of package loading.
+      - name: Report the TeX error
+        if: ${{ failure() }}
+        run: |
+          echo "::group::TeX errors"
+          grep -n -E "^(!|.*:[0-9]+:)" build/paper.log | head -40 || true
+          echo "::endgroup::"
+          first=$(grep -m1 -E "^!" build/paper.log || true)
+          [ -n "$first" ] && echo "::error::$first"
+          exit 0
+
+      # A LaTeX run exits 0 with unresolved cross-references, which print as a literal
+      # `??` in the PDF. Fail on that: a paper with `??` in it is worse than one that
+      # failed to build, because nothing draws attention to it.
+      - name: Reject unresolved references
+        run: |
+          if grep -q "There were undefined references" build/paper.log; then
+            echo "::error::undefined references -- the PDF would contain '??'"
+            grep -n "undefined" build/paper.log || true
+            exit 1
+          fi
+          echo "all references resolved"
+
+      # Every \includegraphics in the paper must have resolved to a real file. latexmk
+      # would have failed on a missing one, but a figure the paper stopped referencing
+      # is a silent regression -- the build stays green while a reader loses a figure.
+      - name: Check every figure reached the PDF
+        run: |
+          want=$(grep -o '\\includegraphics' paper/paper.tex | wc -l)
+          got=$(grep -o '<figures/[^>]*\.png' build/paper.log | sort -u | wc -l)
+          echo "paper references $want figures; $got distinct files were embedded"
+          if [ "$want" -ne "$got" ]; then
+            echo "::error::$want \\includegraphics but $got figures embedded"
+            exit 1
+          fi
+
+      - name: Upload paper.pdf
+        if: ${{ success() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paper-pdf
+          path: build/paper.pdf
+          if-no-files-found: error
+
+      # Kept on failure too: the log is the only way to diagnose a build that cannot be
+      # reproduced on the machine the paper is written on.
+      - name: Upload LaTeX log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paper-latex-log
+          path: build/paper.log
+          if-no-files-found: warn

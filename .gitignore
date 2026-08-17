@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+build/
+figures/
+*.pdf
+!paper/*.pdf
+*.aux
+*.log
+*.out
+
+# Trained models: build products of an hour-and-a-half run, never committed. The one
+# exception is `paper/model/`, which is outside this pattern anyway and holds the single
+# checkpoint the paper's residual figure is drawn from.
+models/

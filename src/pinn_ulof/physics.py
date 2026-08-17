@@ -1,0 +1,773 @@
+"""Single-phase axial thermal-hydraulics (SAS4A/SASSYS-1 Chapter 3).
+
+The pre-boiling energy balance for one channel, discretised on the axial mesh of
+:class:`~pinn_ulof.params.AxialParams`. Four temperature fields —
+fuel, cladding, structure, coolant — one lumped node per material per axial
+position, following the manual's equations:
+
+* **Eq. 3.3-4** fuel-to-cladding flux, gap conductance **plus radiation**;
+* **Eq. 3.3-5** coolant energy in conservative flux form, with **all three**
+  source terms ``Q_c + Q_ec + Q_sc``;
+* **Eq. 3.3-6** direct neutron and gamma heating deposited in the coolant, the
+  fraction ``gamma_c`` of total power — it bypasses the fuel and cladding
+  thermal lag entirely, so power reaches the coolant with no delay;
+* **Eq. 3.9-1** pre-boiling momentum, whose stated assumption is that the flow
+  rate ``w = w(t)`` is **independent of z** (incompressible liquid, one slug
+  filling the channel). That is what makes the advection term below exact rather
+  than approximate — but only until voiding starts (deviation D-TH-2).
+
+:func:`derivatives` is **backend-agnostic**: numpy and JAX both evaluate
+the same expression tree, so the M3 PINN residual and this reference solver
+cannot drift apart. :func:`make_rhs` is the thin scipy adapter that packs the
+four fields into one state vector.
+
+Boiling is **not** here — this is Chapter 3's regime. Void onset and the mixture
+field arrive at M4; the kinetics closure at M6. Until then power is prescribed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+
+from pinn_ulof import sodium
+from pinn_ulof._backend import like as _like
+from pinn_ulof._backend import xp as _xp
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pinn_ulof.params import AxialParams
+    from pinn_ulof.typing_ import FloatArray
+
+type Field = Any
+"""A numeric field: numpy array, JAX array, or a plain float.
+
+Named rather than bare ``Any`` so the backend-agnostic signatures below say what
+they mean, and so they do not each need an ``ANN401`` suppression.
+"""
+
+STEFAN_BOLTZMANN: float = 5.670374419e-8
+"""Stefan-Boltzmann constant [W/m^2-K^4], radiation term of Eq. 3.3-4."""
+
+N_FIELDS: int = 5
+"""Fields per axial node: fuel, cladding, structure and coolant temperatures, plus void."""
+
+
+@dataclass(frozen=True, slots=True)
+class NodeGeometry:
+    """Per-axial-node volumes, surfaces and heat capacities [SI].
+
+    Pure geometry, so it is computed once and shared by every backend.
+    """
+
+    dz: float
+    A_fe: float  # fuel outer surface, fuel -> cladding path
+    A_ec: float  # cladding outer surface, cladding -> coolant path
+    A_sc: float  # structure wetted surface, structure -> coolant path
+    C_f: float  # fuel heat capacity [J/K]
+    C_cl: float  # cladding heat capacity [J/K]
+    C_s: float  # structure heat capacity [J/K]
+    C_c: float  # coolant heat capacity [J/K]
+
+
+def node_geometry(p: AxialParams) -> NodeGeometry:
+    """Derive the per-node geometry and heat capacities from ``p``."""
+    dz = p.H / p.n_axial
+    a_fe = 2.0 * np.pi * p.r_fo * dz
+    a_ec = 2.0 * np.pi * p.r_co * dz
+    a_sc = p.gamma_2 * a_ec
+    v_f = np.pi * p.r_fo**2 * dz
+    v_cl = np.pi * (p.r_co**2 - p.r_ci**2) * dz
+    v_s = p.gamma_2 * 2.0 * np.pi * p.r_co * p.t_struct * dz
+    v_c = p.A_c * dz
+    return NodeGeometry(
+        dz=dz,
+        A_fe=a_fe,
+        A_ec=a_ec,
+        A_sc=a_sc,
+        C_f=p.rho_f * p.c_f * v_f,
+        C_cl=p.rho_cl * p.c_cl * v_cl,
+        C_s=p.rho_s * p.c_s * v_s,
+        C_c=p.rho_c * p.c_c * v_c,
+    )
+
+
+def line_geometry(p: AxialParams) -> NodeGeometry:
+    """Per-unit-length geometry: :func:`node_geometry` with ``dz = 1``.
+
+    Every area and heat capacity in :class:`NodeGeometry` scales linearly with
+    ``dz``, so setting it to one turns the nodal quantities into per-metre ones.
+    That lets :func:`continuous_derivatives` and :func:`derivatives` share the
+    exact same flux functions — the PDE form and its discretisation cannot drift
+    apart, because there is only one of each.
+    """
+    from dataclasses import replace  # noqa: PLC0415 - local to keep the import graph flat
+
+    per_node = node_geometry(p)
+    scale = 1.0 / per_node.dz
+    return replace(
+        per_node,
+        dz=1.0,
+        A_fe=per_node.A_fe * scale,
+        A_ec=per_node.A_ec * scale,
+        A_sc=per_node.A_sc * scale,
+        C_f=per_node.C_f * scale,
+        C_cl=per_node.C_cl * scale,
+        C_s=per_node.C_s * scale,
+        C_c=per_node.C_c * scale,
+    )
+
+
+# --- flow ------------------------------------------------------------------
+def flow_fraction(t: Field, p: AxialParams) -> Field:
+    """Normalised pump coast-down ``g(t)``, with ``g(0) = 1`` (deviation D-FLOW-1).
+
+    The manual's table-look-up pump prescribes *head*, ``H(t) = H_r f(t)`` with
+    ``f(0) = 1`` (Eq. 5.3-61), and lets the loop momentum equation produce the
+    flow. We prescribe the flow directly and decay it exponentially to a
+    natural-circulation floor. Because ``f_nc > 0`` the flow never reverses, so
+    the single upstream boundary condition of Eq. 3.9-1 stays valid by
+    construction — a guarantee that does **not** survive M4's boiling-induced
+    pressure (risk R6).
+    """
+    xp = _xp(t)
+    return p.f_nc + (1.0 - p.f_nc) * xp.exp(-t / p.tau_pump)
+
+
+def flow_rate(t: Field, p: AxialParams) -> Field:
+    """Coolant mass flow rate ``w(t)`` [kg/s], ``z``-independent per Eq. 3.9-1."""
+    return p.w_0 * flow_fraction(t, p)
+
+
+# --- heat transfer paths ---------------------------------------------------
+def gap_flux(T_f: Field, T_cl: Field, geo: NodeGeometry, p: AxialParams) -> Field:
+    """Fuel-to-cladding heat flow per node [W] — Eq. 3.3-4.
+
+    ``q_fe = h_b (T_f - T_cl) + eps sigma (T_f^4 - T_cl^4)``. The radiation term
+    is not decorative: above 1000 K it carries a meaningful share, and it is
+    *stabilising*, growing faster than linearly as the fuel heats.
+    """
+    conduction = p.h_gap * (T_f - T_cl)
+    radiation = p.emissivity * STEFAN_BOLTZMANN * (T_f**4 - T_cl**4)
+    return geo.A_fe * (conduction + radiation)
+
+
+def film_coefficient(h_wet: float, alpha: Field, p: AxialParams) -> Field:
+    """Effective wall-to-coolant film coefficient as the node voids.
+
+    Section 12.5.1 writes the wall-to-vapour resistance as ``1/h_ec + R_ehf``,
+    where ``h_ec`` carries the *combined* liquid-film and vapour resistance. Here
+    that combination is a void-weighted blend between the wetted value and a
+    vapour value two to three orders smaller:
+
+    ``h_eff = (1 - alpha) h_wet + alpha h_vapour``
+
+    This is the safety-relevant coupling and the reason M4 alone was not enough.
+    Losing the liquid does not merely stop the coolant heating up — it removes
+    the heat path, so the cladding temperature runs away. Before M5 the model
+    kept full wetted heat transfer in a fully voided node, which made a boiling
+    run indistinguishable from one that could not boil.
+    """
+    return (1.0 - alpha) * h_wet + alpha * p.h_vapour
+
+
+def coolant_capacity(alpha: Field, p: AxialParams) -> Field:
+    """Volumetric heat capacity of the two-phase mixture [J/m^3-K].
+
+    ``(1 - alpha) rho_l c_l + alpha rho_v c_g``: a voided node has almost no
+    thermal inertia, so it tracks the wall almost instantly.
+
+    **Not used in the residuals, deliberately.** Substituting it into the
+    *temperature*-form energy equation breaks conservation: as ``alpha`` changes
+    the capacity changes, and the correct accounting then needs an enthalpy
+    formulation rather than ``c dT/dt``. Measured cost of using it anyway: the
+    energy closure degrades from 3.6e-6 to ~2e-2. So M5 degrades the **film
+    coefficient** — which is the mechanism section 12.5.1 actually describes —
+    and leaves the mixture capacity to a future enthalpy-form revision. Kept here
+    because it is the right expression and the tests pin its value.
+    """
+    T_sat = sodium.saturation_temperature(p.p_system)
+    vapour = sodium.vapor_density(T_sat) * sodium.vapor_heat_capacity(T_sat)
+    return (1.0 - alpha) * p.rho_c * p.c_c + alpha * vapour
+
+
+def clad_coolant_flux(
+    T_cl: Field, T_c: Field, geo: NodeGeometry, p: AxialParams, alpha: Field = 0.0
+) -> Field:
+    """Cladding-to-coolant heat flow per node [W] — the ``Q_ec`` term of Eq. 3.3-5."""
+    return film_coefficient(p.h_clad_coolant, alpha, p) * geo.A_ec * (T_cl - T_c)
+
+
+def struct_coolant_flux(
+    T_s: Field, T_c: Field, geo: NodeGeometry, p: AxialParams, alpha: Field = 0.0
+) -> Field:
+    """Structure-to-coolant heat flow per node [W] — the ``Q_sc`` term of Eq. 3.3-5.
+
+    Vanishes when ``gamma_2 = 0``, i.e. when the structure node is disabled.
+    """
+    return film_coefficient(p.h_struct_coolant, alpha, p) * geo.A_sc * (T_s - T_c)
+
+
+def nodal_power(amplitude: Field, f_nodes: Field, p: AxialParams) -> tuple[Any, Any]:
+    """Split the nodal power into its fuel and direct-coolant parts [W].
+
+    Returns ``(Q_fuel, Q_coolant)``. The manual deposits a fraction ``gamma_c``
+    of total power straight into the coolant by neutron and gamma heating
+    (Eq. 3.3-6); the remainder is generated in the fuel. ``f_nodes`` is the
+    normalised axial shape sampled at the node centres, so
+    ``sum(f_nodes) / n_axial == 1``.
+    """
+    total = amplitude * p.P_0 * f_nodes / p.n_axial
+    return (1.0 - p.gamma_c) * total, p.gamma_c * total
+
+
+# --- boiling ----------------------------------------------------------------
+def boiling_fraction(T_c: Field, p: AxialParams) -> Field:
+    """Fraction of the wall heat going into vaporisation rather than sensible heat.
+
+    The manual's onset criterion (section 12.4) is a hard threshold: a bubble
+    forms when the coolant exceeds saturation by at least ``DTS``, about 10 K for
+    the first bubble. A hard threshold has no usable autodiff gradient, so it is
+    replaced by a logistic of width ``dT_smooth`` centred on the same criterion,
+    around the saturation temperature of Eq. 12.13-4.
+
+    ``dT_smooth`` is a real accuracy/trainability knob, not a fudge: too wide and
+    boiling starts early and gradually, too narrow and the front is too sharp for
+    a smooth network. It is swept, not guessed.
+    """
+    xp = _xp(T_c)
+    T_sat = sodium.saturation_temperature(p.p_system)
+    x = (T_c - T_sat - p.dT_superheat) / p.dT_smooth
+    return 0.5 * (1.0 + xp.tanh(0.5 * x))
+
+
+def latent_fraction(T_c: Field, alpha: Field, p: AxialParams) -> Field:
+    """Signed fraction of the wall heat that changes phase.
+
+    ``b (1 - alpha) - condensation (1 - b) alpha``: positive where liquid
+    vaporises, negative where vapour condenses. With ``condensation = 0`` the
+    second term vanishes and this is the vaporisation-only form.
+
+    ``b`` is the superheat switch of :func:`boiling_fraction`; the ``(1 - alpha)``
+    factor shuts the source off as a node empties, so the void cannot leave
+    ``[0, 1)`` even before the network's sigmoid clamps it.
+
+    **The same fraction must be removed from the sensible balance and no more.**
+    An earlier version diverted the full ``b q_wall`` from the coolant but only
+    vaporised ``b (1 - alpha) q_wall``, so energy quietly vanished once a node
+    approached dryout — caught by the energy-balance test, not by inspection.
+    Returning the difference to the sensible term conserves energy exactly.
+    Physically, at ``alpha -> 1`` the wall heat goes on heating what is now
+    vapour; that the node keeps the liquid heat capacity is a documented
+    simplification which M5's film and dryout model replaces.
+    """
+    b = boiling_fraction(T_c, p)
+    vaporise = b * (1.0 - alpha)
+    # Condensation is the negative branch of the same film heat flow (section
+    # 12.5): vapour present in a region that is no longer superheated shrinks.
+    # `(1 - b)` is the not-superheated switch and `alpha` the vapour available, so
+    # the term vanishes as the node empties of vapour and `alpha` cannot go
+    # negative. Zero by default -- see `AxialParams.condensation`.
+    condense = p.condensation * (1.0 - b) * alpha
+    return vaporise - condense
+
+
+def quasi_steady_void(T_c: Field, p: AxialParams) -> Field:
+    """Void fraction with the vapour source at quasi-steady state (deviation D-TH-3).
+
+    The vapour source fills a node in ``vaporisation_time(p) = 0.71 ms`` against an
+    advective 0.113 s and a 60 s horizon, so ``alpha`` is a *fast* variable slaved
+    to the temperature field. Eliminating it algebraically is the manoeuvre
+    Stiff-PINN applies to fast chemical species, and the one D-KIN-1 already
+    applies to the prompt neutron mode.
+
+    ``alpha = 1 - (1 - b)**3`` with ``b`` the superheat switch of
+    :func:`boiling_fraction` — the saturating form of ``alpha = 1 - exp(-Theta)``,
+    the exact solution of ``dalpha/dt = b k (1 - alpha)`` along a characteristic,
+    with the accumulated exposure ``Theta`` discretised. Validated against the
+    full differential solution at ``n_axial = 160``, on maximum voided-length
+    error:
+
+    ==============================  ========  =====================
+    closure                         error     d/db at b = 0
+    ==============================  ========  =====================
+    ``b``                           6.2%      1
+    ``1 - (1 - b)**3``              **1.2%**  3
+    ``1 - (1 - b)**2``              1.3%      2
+    ``sqrt(b)``                     1.4%      **infinite — unusable**
+    ``1 - exp(-5 b)``               3.1%      5
+    ``b/(b + eps)`` (local balance) 13.7%     large
+    reference's own mesh error      2.6%      —
+    ==============================  ========  =====================
+
+    So the closure sits inside the reference's own discretisation uncertainty.
+
+    **The derivative at ``b = 0`` is the binding constraint, not the accuracy.**
+    ``b`` underflows to exactly zero over 85% of the domain, so any closure with
+    an unbounded slope there — ``sqrt`` being the obvious one — returns NaN from
+    the first backward pass. Measured: it does, on every seed.
+
+    Two exact properties of the model make the elimination sound rather than
+    convenient. Below saturation ``b`` underflows to *exactly* zero, so the void
+    equation is pure advection there and ``alpha == 0`` is its unique solution
+    under a zero initial and inlet condition. And the source is non-negative
+    everywhere -- there is no condensation term -- so the superheated set is
+    contained in the voided set, measured 967 of 967 samples with zero lag.
+
+    Substituting this for the differential void removes a residual block carrying
+    a normalised rate of 8.5e4 and leaves the front to appear analytically
+    wherever ``T_c`` crosses saturation.
+    """
+    return 1.0 - (1.0 - boiling_fraction(T_c, p)) ** 3
+
+
+def vapour_source(T_c: Field, alpha: Field, q_wall: Field, p: AxialParams) -> Field:
+    """Void generation rate ``d alpha/dt`` from wall heat [1/s].
+
+    Once the superheat criterion is met the wall heat stops raising the coolant
+    temperature and starts making vapour: ``Gamma = b_eff q_wall / lambda_vap``
+    kilograms per second per metre, filling the flow area at the saturated vapour
+    density of Eq. 12.13-6.
+    """
+    T_sat = sodium.saturation_temperature(p.p_system)
+    rho_v = sodium.vapor_density(T_sat)
+    lam = sodium.latent_heat(T_sat)
+    return latent_fraction(T_c, alpha, p) * q_wall / (lam * rho_v * p.A_c)
+
+
+def expansion_velocity(alpha_source: Field, p: AxialParams, dz: float) -> Field:
+    """Extra coolant velocity from vapour expansion [m/s] — deviation D-TH-2.
+
+    Vaporising liquid expands it by ``rho_l/rho_v ~ 3100``, and that expansion has
+    to go somewhere: with both phases incompressible the mixture continuity
+    equation gives ``d u/d z = Gamma_alpha (1 - rho_v/rho_l)``, where
+    ``Gamma_alpha`` is the volumetric vapour generation rate returned by
+    :func:`vapour_source`. Integrating upward from the inlet gives the velocity
+    the slug is pushed at — the mechanism Chapter 12's slug-ejection model exists
+    to capture, in Eulerian form.
+
+    Zero before boiling, because ``Gamma_alpha`` is: Eq. 3.9-1's ``w = w(t)``
+    holds exactly in its own stated regime and this term only switches on where
+    that regime ends.
+    """
+    T_sat = sodium.saturation_temperature(p.p_system)
+    ratio = 1.0 - float(sodium.vapor_density(T_sat)) / p.rho_c
+    return np.cumsum(alpha_source * ratio * dz)
+
+
+def residual_scales(p: AxialParams) -> tuple[float, ...]:
+    """Natural time constant of each residual block [s].
+
+    Returns ``(tau_f, tau_cl, tau_s, tau_c, tau_alpha)``. Each equation is divided
+    by its own rate rather than by one global horizon: the equations are
+    non-dimensionalised, not only the states, as VS-PINN and the scale-aware
+    residual literature formalise.
+
+    The blocks' time constants are 0.58 s (fuel), 0.025 s (cladding), 0.107 s
+    (structure) and 0.113 s (coolant transit, and the void, which is advected at
+    the same velocity) against a 60 s horizon, so ``t_end/tau`` spans 104 to 2378
+    — a 23x spread between residual blocks.
+
+    **These are the rates that govern each block's *dynamics*, which is what a
+    residual must be normalised by.** The void equation additionally carries a
+    source 160x faster than its own transport (:func:`vaporisation_time`), but
+    that term is active only inside the boiling front. Normalising by it instead
+    was measured to destroy the model — see that function.
+
+    **Applied to the residuals (see** :func:`residual_normalisation` **).** Fixed
+    per-equation scaling is a no-op only against an *unbounded* adaptive weight
+    ``lambda_k = mean(g)/g_k``, which cancels any constant on block ``k`` at the
+    next weight update. Here the adaptive weights are clamped to a bounded ratio,
+    because unbounded they run to 5e6 and make every field worse. A cap of ``R``
+    can undo at most ``R^2``
+    of imbalance, and the spread above is **813x** — eight times what a cap of 10
+    can reach. So the fixed part of the imbalance has to come out analytically,
+    leaving the bounded adaptive weighting to handle only what varies during
+    training. Static non-dimensionalisation plus bounded adaptive correction is
+    the VS-PINN prescription [Ko & Park, JCP 529 113860 (2025)] and the
+    multi-magnitude loss framework of [Wang et al., JCP 504 113112 (2024)].
+    """
+    geo = line_geometry(p)
+    tau_f = geo.C_f / (p.h_gap * geo.A_fe)
+    tau_cl = geo.C_cl / (p.h_clad_coolant * geo.A_ec)
+    tau_s = p.rho_s * p.c_s * p.t_struct / p.h_struct_coolant
+    tau_c = geo.C_c / (p.w_0 * p.c_c / p.H)  # advective transit over the height
+    # The void is advected at the liquid velocity, so its DYNAMICAL rate is the
+    # same transit time as the coolant. Its *source* is 160x faster
+    # (:func:`vaporisation_time`) but only inside the front, which is why that
+    # number must not be the one used to normalise — see below.
+    return (tau_f, tau_cl, tau_s, tau_c, tau_c)
+
+
+def vaporisation_time(p: AxialParams) -> float:
+    """Time for the wall heat to vaporise one node's worth of liquid [s].
+
+    ``lambda rho_v A_c H / P_0`` — about **0.71 ms**, so ``d alpha/dt`` reaches
+    ~1400 /s inside the boiling front against an advective 8.8 /s. That 160x is
+    the real stiffness of the void equation, and it is why the front is nearly a
+    discontinuity in time. It is *diagnostic only*.
+
+    **It must not be used to normalise the void residual.** The two rates live in
+    the same equation but not in the same place:
+    vaporisation acts only where ``T_c > T_sat + DTS``, which is under 4% of the
+    domain for most of the transient, while advection acts everywhere. Normalise
+    by the vaporisation time and the front residual becomes O(1) while the
+    advective residual that holds ``alpha = 0`` in the subcooled bulk collapses to
+    **3.9e-5** — so a network that voids the entire channel from ``t = 0`` pays
+    almost nothing. Measured, such a network puts void at 0.25 s at the channel
+    inlet against a reference identically zero until 10.75 s.
+
+    Below saturation ``boiling_fraction`` underflows to *exactly* zero (``tanh``
+    saturates in float64), so there the void equation is pure advection and, with
+    a zero initial condition and a zero inlet condition, ``alpha == 0`` is its
+    unique solution. The physics is unambiguous; only the loss was indifferent.
+    """
+    T_sat = sodium.saturation_temperature(p.p_system)
+    lam, rho_v = sodium.latent_heat(T_sat), sodium.vapor_density(T_sat)
+    return float(lam) * float(rho_v) * p.A_c * p.H / p.P_0
+
+
+def residual_normalisation(p: AxialParams, t_end: float | None = None) -> tuple[float, ...]:
+    """Factor each field residual is multiplied by before squaring — ``tau_k / t_end``.
+
+    Variable scaling in the sense of VS-PINN [Ko & Park, *JCP* 529 113860
+    (2025)]: divide every equation by its own characteristic rate so each
+    residual block is O(1) and no block dominates the loss through its units
+    alone. It is the per-block form of the non-dimensionalisation applied to the
+    states.
+
+    In normalised time a block's derivative is of order ``t_end / tau_k``, so
+    multiplying by ``tau_k / t_end`` brings it to order one. The void block is
+    what forces the issue: ``t_end / tau_alpha = 8.5e4`` against 104 for the fuel
+    (:func:`residual_scales`), because sodium vaporises a node in 0.71 ms.
+
+    The precursor block is handled separately in the backends, per group, since
+    each delayed-neutron group carries its own ``lambda_i`` and the spread within
+    the block is itself two orders of magnitude.
+
+    ``t_end`` defaults to ``p.t_end`` but must be the *trained* horizon when that
+    differs (``AxialTrainConfig.t_train_frac``), since it is normalised time the
+    residual is expressed in.
+    """
+    horizon = p.t_end if t_end is None else t_end
+    return tuple(tau / horizon for tau in residual_scales(p))
+
+
+# --- kinetics closure -------------------------------------------------------
+N_GROUPS: int = 6
+"""Delayed-neutron precursor groups (manual Eq. 4.3-1)."""
+
+
+def reactivity_components(
+    T_f: Field,
+    alpha: Field,
+    T_f0: Field,
+    w_D: Field,
+    w_void: Field,
+    p: AxialParams,
+) -> tuple[Any, Any]:
+    """Return the two reactivity integrals separately, as ``(doppler, void)``.
+
+    Split out from :func:`reactivity` because the *net* number hides which
+    mechanism produced it. Reporting ``max rho/beta = 0`` without the split led
+    this project to read a purely negative void term as "the closed loop is
+    self-limiting" when the void worth had simply never been sampled with a
+    positive sign — see :meth:`AxialTrajectory.void_worth_is_exercised`.
+
+    The first return value carries **both** fuel-temperature mechanisms: the
+    logarithmic Doppler and the linear axial expansion of section 4.5.4, which is
+    negative and therefore stabilising. They share the axial weight because the
+    manual evaluates both on the radial mass-averaged fuel temperature.
+
+    * **Doppler, logarithmic** — ``delta_k_D = alpha_D ln(T_f/T_f0)`` (Eq. 4.5-3,
+      integrated from ``T_f d(delta_k)/dT_f = alpha_D``), with ``alpha_D`` itself
+      interpolated between its flooded and voided values (section 4.5.3), so
+      voiding modulates the feedback that has to bound the excursion.
+    * **Coolant density and voiding together** — ``sum_j (rho_c)_j alpha_j``
+      (Eq. 4.5-25). One worth distribution, not two coefficients: that is the
+      manual's model and it removes the double-counting the 0D split risks at
+      onset.
+
+    ``w_D`` and ``w_void`` are the per-segment weights times the axial cell width,
+    so the sums are quadratures.
+    """
+    xp = _xp(T_f)
+    doppler = (w_D * p.alpha_D(alpha) * xp.log(T_f / T_f0)).sum(-1)
+    # Axial fuel expansion (section 4.5.4): linear in the fuel temperature rise,
+    # negative, and zero at nominal so it needs no criticality offset either.
+    doppler = doppler + p.alpha_expansion * (w_D * (T_f - T_f0)).sum(-1)
+    return doppler, (w_void * alpha).sum(-1)
+
+
+def reactivity(
+    T_f: Field,
+    alpha: Field,
+    T_f0: Field,
+    w_D: Field,
+    w_void: Field,
+    p: AxialParams,
+) -> Field:
+    """Net reactivity from the axial fields (manual section 4.5).
+
+    The sum of :func:`reactivity_components` and the external insertion.
+    **No criticality offset is needed**: at nominal ``T_f = T_f0`` and
+    ``alpha = 0``, so both integrals vanish identically and the reactor is
+    exactly critical — a free consequence of the logarithmic form.
+    """
+    doppler, void = reactivity_components(T_f, alpha, T_f0, w_D, w_void, p)
+    return p.rho_ext + doppler + void
+
+
+def prompt_jump_power(c: Field, rho: Field, p: AxialParams, floor: float = 0.05) -> Field:
+    """Normalised power from the prompt jump approximation.
+
+    Setting ``dP/dt = 0`` in Eq. 4.2-4 and eliminating ``P``:
+
+    ``P = sum_i beta_i c_i / (beta - rho)``
+
+    With ``c_i(0) = 1`` this gives ``P(0) = beta/beta = 1`` exactly, so the
+    nominal state is a true fixed point with no tuning.
+
+    **This is a deviation from SAS4A, not a simplification of it** (D-KIN-1): the
+    manual solves the full point kinetics equations and the phrase "prompt jump"
+    appears nowhere in it. The justification is PINN trainability — it removes the
+    ``Lambda ~ 5e-7 s`` mode — not fidelity.
+
+    The closure has a **pole at prompt criticality**. ``floor`` clamps the
+    denominator at ``floor * beta`` so a run cannot silently pass through it;
+    callers must still report ``max rho/beta`` and treat anything approaching 1 as
+    outside the approximation rather than as a result.
+    """
+    # `clip` rather than `maximum` because it accepts a scalar bound and numpy and JAX
+    # spell it the same way. The clamp is a guard, not a model: callers must still
+    # report `max rho/beta` and treat anything near 1 as outside the approximation.
+    gap = _xp(rho).clip(p.beta_eff - rho, floor * p.beta_eff, None)
+    weighted = (_like(c, p.beta_i) * c).sum(-1)
+    if getattr(c, "ndim", 1) > 1:
+        weighted = weighted.reshape(-1, 1)
+    return weighted / gap
+
+
+def decay_heat_derivatives(h: Field, power_fission: Field, p: AxialParams) -> Field:
+    """``dh_j/dt = lambda_j (f_d a_j psi_f - h_j)`` — manual section 4.4 in group form.
+
+    Each group relaxes toward its equilibrium share of the fission power on its own
+    decay constant. The slowest is hours, so ``psi_h`` outlives any prompt-jump
+    transient — which is exactly why it removes the zero-power attractor.
+    """
+    lam = _like(h, p.lambda_i[: len(p.decay_lambda)] * 0.0 + p.decay_lambda)
+    weight = _like(h, p.decay_fraction * p.decay_weight)
+    return lam * (weight * power_fission - h)
+
+
+def total_power(power_fission: Field, h: Field, p: AxialParams) -> Field:
+    """``psi_t = psi_f + psi_h`` — manual Eq. 4.2-2.
+
+    The fission channel carries ``1 - decay_fraction`` so the nominal total is
+    exactly one and no criticality retuning is needed.
+    """
+    return (1.0 - p.decay_fraction) * power_fission + h.sum(-1)
+
+
+def precursor_derivatives(c: Field, power: Field, p: AxialParams) -> Field:
+    """``dc_i/dt = lambda_i (P - c_i)`` — Eq. 4.3-1 in normalised form."""
+    return _like(c, p.lambda_i) * (power - c)
+
+
+# --- the coupled right-hand side -------------------------------------------
+def derivatives(
+    t: Field,
+    T_f: Field,
+    T_cl: Field,
+    T_s: Field,
+    T_c: Field,
+    alpha: Field,
+    p: AxialParams,
+    geo: NodeGeometry,
+    f_nodes: Field,
+    amplitude: Field = 1.0,
+) -> tuple[Any, ...]:
+    """Time derivatives of the four temperatures [K/s] and the void fraction [1/s].
+
+    Backend-agnostic: arithmetic plus ``exp``, ``tanh`` and ``concatenate``, all
+    provided under the same name by numpy and JAX, so the reference solver
+    and the PINN residual share one expression tree.
+
+    Both advected fields use **first-order upwind** differencing of the
+    conservative flux form of Eq. 3.3-5. Upwind rather than a higher order was
+    chosen at M2 precisely because it is monotone and will not oscillate across
+    the boiling front introduced here.
+    """
+    xp = _xp(T_c)
+    q_fe = gap_flux(T_f, T_cl, geo, p)
+    q_ec = clad_coolant_flux(T_cl, T_c, geo, p, alpha)
+    q_sc = struct_coolant_flux(T_s, T_c, geo, p, alpha)
+    q_fuel, q_cool = nodal_power(amplitude, f_nodes, p)
+
+    # Wall heat reaching the coolant. Below the superheat criterion it raises the
+    # temperature; above it, it makes vapour instead (manual section 12.4).
+    q_wall = q_cool + q_ec + q_sc
+    b = latent_fraction(T_c, alpha, p)
+
+    inlet = T_c[:1] * 0.0 + p.T_in
+    T_up = xp.concatenate([inlet, T_c[:-1]])
+    w = flow_rate(t, p)
+    if p.flow_expansion:
+        w = w + expansion_velocity(vapour_source(T_c, alpha, q_wall / geo.dz, p), p, geo.dz) * (
+            p.rho_c * p.A_c
+        )
+    advection = w * p.c_c * (T_up - T_c)
+
+    # Void advects at the liquid velocity; the inlet is subcooled, so none enters.
+    a_up = xp.concatenate([alpha[:1] * 0.0, alpha[:-1]])
+    u = flow_rate(t, p) / (p.rho_c * p.A_c)
+    source = vapour_source(T_c, alpha, q_wall / geo.dz, p)
+    if p.flow_expansion:
+        # Vapour generation accelerates the mixture (D-TH-2). Upwind, so a node
+        # sees the expansion accumulated below it.
+        u = u + expansion_velocity(source, p, geo.dz)
+    d_alpha = source + u * (a_up - alpha) / geo.dz
+
+    dT_s = (
+        -film_coefficient(p.h_struct_coolant, alpha, p)
+        * (T_s - T_c)
+        / (p.rho_s * p.c_s * p.t_struct)
+    )
+    return (
+        (q_fuel - q_fe) / geo.C_f,
+        (q_fe - q_ec) / geo.C_cl,
+        dT_s,
+        (advection + (1.0 - b) * q_wall) / geo.C_c,
+        d_alpha,
+    )
+
+
+def continuous_derivatives(
+    t: Field,
+    T_f: Field,
+    T_cl: Field,
+    T_s: Field,
+    T_c: Field,
+    alpha: Field,
+    dTc_dz: Field,
+    dalpha_dz: Field,
+    p: AxialParams,
+    geo: NodeGeometry,
+    f_zeta: Field,
+    amplitude: Field = 1.0,
+) -> tuple[Any, ...]:
+    """PDE right-hand sides — the mesh-free form of :func:`derivatives`.
+
+    Identical physics, with the discrete upwind differences replaced by the true
+    axial gradients supplied by the caller (autodiff, for the PINN). ``geo`` must
+    be :func:`line_geometry` and ``f_zeta`` the axial shape at the same points.
+
+    Sharing the flux and boiling closures with the reference solver means the
+    network and its ground truth solve the same equations by construction rather
+    than by review.
+    """
+    q_fe = gap_flux(T_f, T_cl, geo, p)
+    q_ec = clad_coolant_flux(T_cl, T_c, geo, p, alpha)
+    q_sc = struct_coolant_flux(T_s, T_c, geo, p, alpha)
+    # Power per METRE. `nodal_power` returns per-node watts (it divides by
+    # n_axial) and a node spans dz = H / n_axial, so the per-metre form is simply
+    # the total divided by H -- no factor of n_axial anywhere.
+    total = amplitude * p.P_0 * f_zeta / p.H
+    q_cool, q_fuel = p.gamma_c * total, (1.0 - p.gamma_c) * total
+
+    q_wall = q_cool + q_ec + q_sc
+    b = latent_fraction(T_c, alpha, p)
+    advection = flow_rate(t, p) * p.c_c * dTc_dz
+    u = flow_rate(t, p) / (p.rho_c * p.A_c)
+    dT_s = (
+        -film_coefficient(p.h_struct_coolant, alpha, p)
+        * (T_s - T_c)
+        / (p.rho_s * p.c_s * p.t_struct)
+    )
+    return (
+        (q_fuel - q_fe) / geo.C_f,
+        (q_fe - q_ec) / geo.C_cl,
+        dT_s,
+        ((1.0 - b) * q_wall - advection) / geo.C_c,
+        vapour_source(T_c, alpha, q_wall, p) - u * dalpha_dz,
+    )
+
+
+def n_decay(p: AxialParams) -> int:
+    """Decay-heat groups carried in the state vector; zero when decay heat is off."""
+    return len(p.decay_lambda) if p.decay_fraction > 0.0 else 0
+
+
+def unpack(y: Field, n: int, n_h: int = 0) -> tuple[Any, ...]:
+    """Split a flat state vector into the five fields plus the precursor vector.
+
+    Layout: ``[T_f, T_cl, T_s, T_c, alpha]`` of length ``n`` each, then the six
+    delayed-neutron precursors. The precursors are global rather than axial —
+    the point kinetics amplitude is one number for the whole channel, which is
+    exactly the separable-flux assumption of Eq. 4.2-1 that justifies point
+    kinetics in the first place.
+    """
+    fields = tuple(y[k * n : (k + 1) * n] for k in range(N_FIELDS))
+    kin = N_FIELDS * n
+    if n_h == 0:
+        return (*fields, y[kin:])
+    return (*fields, y[kin : kin + N_GROUPS], y[kin + N_GROUPS :])
+
+
+def kinetics_weights(p: AxialParams) -> tuple[Field, Field]:
+    """Axial quadrature weights for the two reactivity integrals.
+
+    Doppler is weighted by the axial power shape — the feedback follows the flux,
+    which is the manual's ``WDOPA`` in continuous form — and the void by the
+    per-segment worth of Eq. 4.5-25. Both carry the cell width, so the sums in
+    :func:`reactivity` are quadratures rather than bare sums.
+    """
+    zeta = p.zeta_nodes()
+    dz = 1.0 / p.n_axial
+    return p.power_shape(zeta) * dz, p.void_worth(zeta) * dz
+
+
+def make_rhs(
+    p: AxialParams,
+    amplitude: Callable[[float], float] | None = None,
+    T_f0: FloatArray | None = None,
+) -> Callable[[float, FloatArray], FloatArray]:
+    """Build ``f(t, y)`` for :func:`scipy.integrate.solve_ivp`.
+
+    Parameters
+    ----------
+    p
+        Channel configuration.
+    amplitude
+        Prescribed normalised power ``P(t)/P_0``. Defaults to a constant 1.0,
+        the open-loop configuration; :func:`kinetics_closure` makes this an
+        output rather than an input.
+    """
+    geo = node_geometry(p)
+    f_nodes = p.power_shape(p.zeta_nodes())
+    n = p.n_axial
+    w_D, w_void = kinetics_weights(p)
+
+    n_h = n_decay(p)
+
+    def rhs(t: float, y: FloatArray) -> FloatArray:
+        T_f, T_cl, T_s, T_c, alpha, c, *rest = unpack(y, n, n_h)
+        h = rest[0] if rest else None
+        if T_f0 is None:
+            # Plan B (M2/M3): power is prescribed, the precursors just decay.
+            fission = amplitude(t) if amplitude is not None else 1.0
+        else:
+            # Plan A (M6): power is an OUTPUT, closed by the prompt jump.
+            fission = prompt_jump_power(c, reactivity(T_f, alpha, T_f0, w_D, w_void, p), p)
+        # The fields see psi_t = psi_f + psi_h (Eq. 4.2-2); the kinetics see psi_f.
+        power = fission if h is None else total_power(fission, h, p)
+        d = derivatives(t, T_f, T_cl, T_s, T_c, alpha, p, geo, f_nodes, power)
+        tail = [precursor_derivatives(c, fission, p)]
+        if h is not None:
+            tail.append(decay_heat_derivatives(h, fission, p))
+        return np.concatenate([*d, *tail])
+
+    return rhs
